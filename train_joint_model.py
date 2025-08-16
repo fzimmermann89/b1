@@ -33,16 +33,18 @@ class BatchDict(TypedDict):
 
 
 class DataAugmentation(torch.nn.Module):
-    """Self-contained data augmentation module for Stage 2."""
-
     def __init__(
         self,
-        p_affine: float = 0.5,
+        p_affine: float = 0.75,
         degrees: float = 5,
-        translate: float = 0.01,
+        translate: float = 0.02,
         scale: float = 0.02,
+        p_phase: float = 0.0,
+        max_phase_rad: float = 0.3,
     ):
         super().__init__()
+        self.p_phase = p_phase
+        self.max_phase_rad = max_phase_rad
         self.affine = kornia.augmentation.RandomAffine(
             p=p_affine,
             degrees=degrees,
@@ -50,10 +52,44 @@ class DataAugmentation(torch.nn.Module):
             scale=(1 - scale, 1 + scale),
         )
 
-    def forward(self, *tensors):
-        params = self.affine.forward_parameters(tensors[0].shape)
-        tensors = tuple(self.affine(t, params=params) for t in tensors)
-        return tensors
+    def forward(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        first_t = tensors[0]
+        shape_t = (
+            rearrange(
+                torch.view_as_real(first_t),
+                'batch coils y x realimag -> batch (coils realimag) y x',
+            )
+            if torch.is_complex(first_t)
+            else first_t
+        )
+        params = self.affine.forward_parameters(shape_t.shape)
+
+        b, device = first_t.shape[0], first_t.device
+        phase = (torch.rand((b, 1, 1, 1), device=device) * 2 - 1) * self.max_phase_rad
+        mask = torch.rand((b, 1, 1, 1), device=device) < self.p_phase
+        phase_exp = torch.exp(1j * phase * mask)
+
+        out = []
+        for t in tensors:
+            if torch.is_complex(t):
+                t = t * phase_exp
+                t_real = rearrange(
+                    torch.view_as_real(t),
+                    'batch coils y x realimag -> batch (coils realimag) y x',
+                )
+                t_real_aug = self.affine(t_real, params=params)
+                t_aug = torch.view_as_complex(
+                    rearrange(
+                        t_real_aug,
+                        'batch (coils realimag) y x -> batch coils y x realimag',
+                        realimag=2,
+                    ).contiguous()
+                )
+                out.append(t_aug)
+            else:
+                out.append(self.affine(t, params=params))
+
+        return tuple(out)
 
 
 locations = ('Minnesota', 'Buch', 'Heidelberg')
@@ -110,15 +146,13 @@ class B1LocalizerDS(torch.utils.data.Dataset):
         file_idx = torch.searchsorted(cum_slices, idx, side='right')
         slice_idx = idx - cum_slices[file_idx - 1] if file_idx > 0 else idx
         with h5py.File(self.files[file_idx], 'r') as f:
-            b1 = torch.tensor(np.array(f['b1'][slice_idx]))
-            mask = torch.tensor(np.array(f['mask'][slice_idx]))
-            localizer = torch.tensor(np.array(f['localizer'][slice_idx]))
+            b1 = torch.from_numpy(f['b1'][slice_idx].astype(np.complex64)).moveaxis(-1, 0)
+            mask = torch.from_numpy(f['mask'][slice_idx].astype(np.float32))[None, ...]
+            localizer = torch.from_numpy(f['localizer'][slice_idx].astype(np.complex64)).moveaxis(-1, 0)
             location = locations.index(f.attrs['location'])
             orientation = orientations.index(f.attrs['orientation'])
             subject_idx = f.attrs['index']
-        localizer = rearrange(torch.view_as_real(localizer), '... coils realimag -> (coils realimag) ...')
-        b1 = rearrange(torch.view_as_real(b1), ' ... coils realimag -> (coils realimag) ...')
-        mask = mask.unsqueeze(0).float()
+
         b1, mask, localizer = self.pad_or_random_crop(b1, mask, localizer)
         return {
             'localizer': localizer,
@@ -127,7 +161,7 @@ class B1LocalizerDS(torch.utils.data.Dataset):
             'location': torch.tensor(location, dtype=torch.long),
             'orientation': torch.tensor(orientation, dtype=torch.long),
             'subject_idx': torch.tensor(subject_idx, dtype=torch.long),
-            'slice_idx': torch.tensor(slice_idx, dtype=torch.long),
+            'slice_idx': slice_idx.long(),
         }
 
 
@@ -145,7 +179,7 @@ class B1LocalizerModule(pl.LightningDataModule):
         augment: None | DataAugmentation = None,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['augment'])
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.augment = augment
@@ -180,11 +214,17 @@ class B1LocalizerModule(pl.LightningDataModule):
         return batch
 
 
+class MaskedL1Loss(torch.nn.Module):
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+        loss = (mask * (pred - target).abs()).sum()
+        loss = loss / (mask.sum() + 1e-9)
+        return loss
+
+
 class MaskedMSELoss(torch.nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
-        mask = mask.broadcast_to(pred.shape)
-        loss = (mask * (pred - target)).square().sum()
-        loss = loss / (mask.sum() + 1e-6)
+        loss = (mask * (pred - target).abs().square()).sum()
+        loss = loss / (mask.sum() + 1e-9)
         return loss
 
 
@@ -201,7 +241,7 @@ class B1Predictor(pl.LightningModule):
         n_rx: int = 32,
         n_tx: int = 8,
         embedding_dim: int = 64,
-        loss: torch.nn.Module = MaskedMSELoss(),
+        loss: torch.nn.Module = MaskedL1Loss(),
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['loss'])
@@ -213,65 +253,86 @@ class B1Predictor(pl.LightningModule):
             cond_dim=embedding_dim,
             n_features=n_features,
             attention_depths=attention_depths,
+            encoder_blocks_per_scale=2,
         )
         self.unet = torch.compile(self.unet, dynamic=False, fullgraph=True)
-        self.location_embedding = torch.nn.Embedding(len(locations), embedding_dim)
-        self.orientation_embedding = torch.nn.Embedding(len(orientations), embedding_dim)
-        self.criterion = MaskedMSELoss()
+        self.location_embedding = torch.nn.Embedding(len(locations), embedding_dim // 2)
+        self.orientation_embedding = torch.nn.Embedding(len(orientations), embedding_dim // 2)
+        self.cond_mlp = torch.nn.Sequential(
+            torch.nn.Linear(embedding_dim, embedding_dim),
+            torch.nn.Dropout(0.1),
+            torch.nn.GELU(),
+            torch.nn.Linear(embedding_dim, embedding_dim),
+            torch.nn.Dropout(0.1),
+        )
+        self.criterion = loss
 
-    def forward(
-        self,
-        localizer: torch.Tensor,
-        location: torch.Tensor,
-        orientation: torch.Tensor,
-    ):
+    def forward(self, localizer: torch.Tensor, location: torch.Tensor, orientation: torch.Tensor) -> torch.Tensor:
+        localizer_real = rearrange(
+            torch.view_as_real(localizer),
+            'batch coils y x realimag -> batch (coils realimag) y x',
+        )
+
         if self.hparams.append_rss:
-            rss = localizer.square().abs().sum(dim=1).sqrt()
-            localizer = torch.cat([localizer, rss[:, None]], dim=1)
+            rss = localizer.abs().square().sum(dim=1).sqrt()
+            localizer_real = torch.cat([localizer_real, rss[:, None]], dim=1)
 
-        location = self.location_embedding(location)
-        orientation = self.orientation_embedding(orientation)
-        cond = location + orientation
+        location_emb = self.location_embedding(location)
+        orientation_emb = self.orientation_embedding(orientation)
+        cond = torch.cat([location_emb, orientation_emb], dim=1)
+        cond = self.cond_mlp(cond)
 
-        return self.unet(localizer, cond=cond)
+        prediction = self.unet(localizer_real, cond=cond)
+        prediction = torch.view_as_complex(
+            rearrange(
+                prediction,
+                'batch (coils realimag) y x -> batch coils y x realimag',
+                realimag=2,
+            ).contiguous()
+        ).to(torch.complex64)
+        return prediction
 
     def training_step(self, batch: BatchDict, batch_idx: int):
-        pred = self(batch['localizer'], batch['location'], batch['orientation'])
-        loss = self.criterion(pred, batch['b1'], batch['mask'])
+        pred_complex = self(batch['localizer'], batch['location'], batch['orientation'])
+        loss = self.criterion(pred_complex, batch['b1'], batch['mask'])
         self.log('train_loss', loss, prog_bar=True, on_epoch=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch: BatchDict, batch_idx: int):
-        pred = self(batch['localizer'], batch['location'], batch['orientation'])
-        loss = self.criterion(pred, batch['b1'], batch['mask'])
-        self.log('val_loss', loss, sync_dist=True)
+        prediction = self(batch['localizer'], batch['location'], batch['orientation'])
+        gt = batch['b1']
+        mask = batch['mask']
+        mask_sum = mask.sum() + 1e-9
 
-        def to_complex(x):
-            x = rearrange(x, ' batch (coils realimag) ... -> batch coils ... realimag', realimag=2)
-            x = torch.view_as_complex(x.contiguous())
-            return x * batch['mask']
+        location_str = locations[batch['location'][0].item()]
+        orientation_str = orientations[batch['orientation'][0].item()]
+        metrics = {}
 
-        gt_complex = to_complex(batch['b1'])
-        pred_complex = to_complex(pred)
-        ssim_magnitude = structural_similarity_index_measure(pred_complex.abs(), gt_complex.abs(), data_range=1.0)
-        ssim_phase = structural_similarity_index_measure(
-            pred_complex.angle(), gt_complex.angle(), data_range=(-np.pi, np.pi)
+        metrics['loss'] = self.criterion(prediction, gt, mask)
+        metrics['l1'] = (mask * (prediction - gt).abs()).sum() / (mask_sum * gt.shape[1])
+        metrics['mse_complex'] = (mask * (prediction - gt).abs()).square().sum() / (mask_sum * gt.shape[1])
+        metrics['ssim_magnitude'] = structural_similarity_index_measure(
+            prediction.abs() * mask, gt.abs() * mask, data_range=1.0
         )
+        angle_diff = prediction.angle() - gt.angle()
+        angle_error = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff)).abs()
+        metrics['mae_phase'] = (angle_error * mask).sum() / (mask_sum * gt.shape[1])
 
-        self.log('val_ssim_magnitude', ssim_magnitude, sync_dist=True)
-        self.log('val_ssim_phase', ssim_phase, sync_dist=True)
+        for name, value in metrics.items():
+            self.log(f'validation/{name}', value, sync_dist=True, prog_bar=name == 'loss')
+            self.log(f'validation/{location_str}/{orientation_str}/{name}', value, sync_dist=True)
 
         subject_idx = batch['subject_idx'][0].item()
         slice_idx = batch['slice_idx'][0].item()
 
-        if subject_idx == 4 and slice_idx == 5:
+        if subject_idx == 2 and slice_idx == 5:
             n_tx = self.hparams.n_tx
             fig, axes = plt.subplots(4, n_tx, figsize=(n_tx * 2, 8), constrained_layout=True)
-            nan_mask = np.where(batch['mask'][0].cpu().numpy() < 0.5, np.nan, 1)
-            gt_mag = gt_complex.abs()[0].cpu().numpy() * nan_mask
-            pred_mag = pred_complex.abs()[0].cpu().numpy() * nan_mask
-            gt_phase = gt_complex.angle()[0].cpu().numpy() * nan_mask
-            pred_phase = pred_complex.angle()[0].cpu().numpy() * nan_mask
+            nan_mask = np.where(mask[0].cpu().numpy() < 0.5, np.nan, 1)
+            gt_mag = gt.abs()[0].cpu().numpy() * nan_mask
+            pred_mag = prediction.abs()[0].cpu().numpy() * nan_mask
+            gt_phase = gt.angle()[0].cpu().numpy() * nan_mask
+            pred_phase = prediction.angle()[0].cpu().numpy() * nan_mask
 
             for i in range(n_tx):
                 axes[0, i].imshow(gt_mag[i], cmap='gray')
@@ -288,20 +349,28 @@ class B1Predictor(pl.LightningModule):
                 ax.set_xticks([])
                 ax.set_yticks([])
 
-            location_str = locations[batch['location'][0].item()]
-            orientation_str = orientations[batch['orientation'][0].item()]
             fig.suptitle(f'S:{subject_idx} Sl:{slice_idx} L:{location_str} O:{orientation_str}')
             self.logger.run[f'val_images/{location_str}/{orientation_str}'].log(fig)
             plt.close(fig)
 
-        return loss
+        return metrics['loss']
 
     def configure_optimizers(self):
+        decay, no_decay = [], []
+        for name, param in self.named_parameters():
+            if any(key in name for key in ('embedding', 'last_block', 'first')):
+                no_decay.append(param)
+            else:
+                decay.append(param)
+
         opt_g = torch.optim.AdamW(
-            self.parameters(),
+            [
+                {'params': decay, 'weight_decay': self.hparams.weight_decay},
+                {'params': no_decay, 'weight_decay': 0.0},
+            ],
             lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
         )
+
         sched_g = OneCycleLR(
             opt_g,
             max_lr=self.hparams.lr,
@@ -318,22 +387,24 @@ if __name__ == '__main__':
     torch._inductor.config.worker_start_method = 'fork'
     torch._inductor.config.compile_threads = 4
     torch._dynamo.config.capture_scalar_outputs = True
-    # torch._functorch.config.activation_memory_budget = 0.9
 
     dm = B1LocalizerModule(
         train_dir='/echo/allgemein/projects/MRpro/B1/FFZHK/processed/train',
         val_dir='/echo/allgemein/projects/MRpro/B1/FFZHK/processed/val',
-        batch_size=4,
-        num_workers=4,
+        batch_size=8,
+        num_workers=8,
         augment=DataAugmentation(),
+        locations=('Buch', 'Minnesota', 'Heidelberg'),
     )
 
     model = B1Predictor(
-        lr=2e-4,
-        weight_decay=1e-4,
-        n_features=(64, 128, 192, 256),
-        attention_depths=(-1, -2),
+        lr=5e-4,
+        weight_decay=1e-3,
+        n_features=(64, 96, 128, 128),
+        attention_depths=(-1,),
         append_rss=True,
+        embedding_dim=128,
+        loss=MaskedMSELoss(),
     )
 
     logger = NeptuneLogger(
@@ -341,15 +412,14 @@ if __name__ == '__main__':
         log_model_checkpoints=False,
         dependencies='infer',
         source_files=[__file__],
-        api_key='eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiIyOTdlYTM3NS0wMWU1LTRlMzMtYWU1Ny01MzMzN2ExNTcwMDcifQ==',
     )
     logger.log_model_summary(model=model, max_depth=-1)
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_loss',
+        monitor='validation/l1',
         mode='min',
         save_top_k=3,
         dirpath=f'checkpoints/b1/{logger.version}',
-        filename=f'b1-{logger.version}-{{epoch:02d}}-{{val_loss:.4f}}',
+        filename=f'b1-{logger.version}-{{epoch:02d}}-{{validation/l1:.4f}}',
         save_last=True,
     )
     ddp_strategy = DDPStrategy(find_unused_parameters=False)
@@ -365,7 +435,7 @@ if __name__ == '__main__':
         ],
         log_every_n_steps=2,
         check_val_every_n_epoch=4,
-        precision='16-mixed',
+        precision='32-true',
         # strategy=ddp_strategy,
     )
 
