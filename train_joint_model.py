@@ -1,4 +1,4 @@
-import warnings
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -11,15 +11,19 @@ import pytorch_lightning as pl
 import torch
 from einops import rearrange
 from mrpro.nn.nets import UNet
-from neptune.common.warnings import NeptuneUnsupportedValue
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.cli import LightningCLI
 from pytorch_lightning.loggers import NeptuneLogger
-from pytorch_lightning.strategies import DDPStrategy
-from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 from torchmetrics.functional import structural_similarity_index_measure
 
-warnings.filterwarnings('error', category=NeptuneUnsupportedValue)
+if not sys.warnoptions:
+    print('setting warnings to ignore')
+    import os
+    import warnings
+
+    warnings.simplefilter('ignore')
+    os.environ['PYTHONWARNINGS'] = 'ignore'
 
 
 class BatchDict(TypedDict):
@@ -32,68 +36,16 @@ class BatchDict(TypedDict):
     slice_idx: torch.Tensor
 
 
-class DataAugmentation(torch.nn.Module):
-    def __init__(
-        self,
-        p_affine: float = 0.75,
-        degrees: float = 5,
-        translate: float = 0.02,
-        scale: float = 0.02,
-        p_phase: float = 0.0,
-        max_phase_rad: float = 0.3,
-    ):
-        super().__init__()
-        self.p_phase = p_phase
-        self.max_phase_rad = max_phase_rad
-        self.affine = kornia.augmentation.RandomAffine(
-            p=p_affine,
-            degrees=degrees,
-            translate=(translate, translate),
-            scale=(1 - scale, 1 + scale),
-        )
-
-    def forward(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        first_t = tensors[0]
-        shape_t = (
-            rearrange(
-                torch.view_as_real(first_t),
-                'batch coils y x realimag -> batch (coils realimag) y x',
-            )
-            if torch.is_complex(first_t)
-            else first_t
-        )
-        params = self.affine.forward_parameters(shape_t.shape)
-
-        b, device = first_t.shape[0], first_t.device
-        phase = (torch.rand((b, 1, 1, 1), device=device) * 2 - 1) * self.max_phase_rad
-        mask = torch.rand((b, 1, 1, 1), device=device) < self.p_phase
-        phase_exp = torch.exp(1j * phase * mask)
-
-        out = []
-        for t in tensors:
-            if torch.is_complex(t):
-                t = t * phase_exp
-                t_real = rearrange(
-                    torch.view_as_real(t),
-                    'batch coils y x realimag -> batch (coils realimag) y x',
-                )
-                t_real_aug = self.affine(t_real, params=params)
-                t_aug = torch.view_as_complex(
-                    rearrange(
-                        t_real_aug,
-                        'batch (coils realimag) y x -> batch coils y x realimag',
-                        realimag=2,
-                    ).contiguous()
-                )
-                out.append(t_aug)
-            else:
-                out.append(self.affine(t, params=params))
-
-        return tuple(out)
-
-
 locations = ('Minnesota', 'Buch', 'Heidelberg')
 orientations = ('Sagittal', 'Coronal', 'Transversal')
+
+
+def complex_to_real(x: torch.Tensor) -> torch.Tensor:
+    return rearrange(torch.view_as_real(x), 'b c ... realimag -> b (c realimag) ...')
+
+
+def real_to_complex(x: torch.Tensor) -> torch.Tensor:
+    return torch.view_as_complex(rearrange(x, 'b (c realimag) ... -> b c ... realimag', realimag=2).contiguous())
 
 
 class B1LocalizerDS(torch.utils.data.Dataset):
@@ -117,22 +69,42 @@ class B1LocalizerDS(torch.utils.data.Dataset):
         data_path: Path,
         orientations: Sequence[Literal['Sagittal', 'Coronal', 'Transversal']] = orientations,
         locations: Sequence[Literal['Minnesota', 'Buch', 'Heidelberg']] = locations,
+        fold: int = 0,
+        n_folds: int = 4,
+        train: bool = True,
     ):
         self.data_path = data_path
-        files = []
-        n_slices = []
-        for fn in Path(data_path).rglob('*.h5'):
+        self.size = (96, 128)
+
+        all_files = []
+        for fn in sorted(Path(data_path).rglob('*.h5')):
             with h5py.File(fn, 'r') as f:
                 location = f.attrs['location']
                 orientation = f.attrs['orientation']
+                subject_idx = int(f.attrs['index'])
                 if location in locations and orientation in orientations:
-                    files.append(fn)
-                    n_slices.append(f['b1'].shape[0])
-        if not len(files):
+                    all_files.append((fn, subject_idx))
+
+        if n_folds < 2:
+            raise ValueError('n_folds must be greater than 1')
+        if not 0 <= fold < n_folds:
+            raise ValueError(f'fold must be in [0, {n_folds - 1}], got {fold}')
+        if train:
+            files_to_use = [fn for (fn, subject_idx) in all_files if subject_idx % n_folds != fold]
+        else:
+            files_to_use = [fn for (fn, subject_idx) in all_files if subject_idx % n_folds == fold]
+
+        files = []
+        n_slices = []
+        for fn in files_to_use:
+            with h5py.File(fn, 'r') as f:
+                files.append(fn)
+                n_slices.append(f['b1'].shape[0])
+
+        if not files:
             raise ValueError(f'No files found for locations {locations} and orientations {orientations} in {data_path}')
         self.files = files
         self.n_slices = n_slices
-        self.size = (96, 128)
 
     def __len__(self):
         return sum(self.n_slices)
@@ -145,6 +117,7 @@ class B1LocalizerDS(torch.utils.data.Dataset):
         idx = idx % total_slices
         file_idx = torch.searchsorted(cum_slices, idx, side='right')
         slice_idx = idx - cum_slices[file_idx - 1] if file_idx > 0 else idx
+
         with h5py.File(self.files[file_idx], 'r') as f:
             b1 = torch.from_numpy(f['b1'][slice_idx].astype(np.complex64)).moveaxis(-1, 0)
             mask = torch.from_numpy(f['mask'][slice_idx].astype(np.float32))[None, ...]
@@ -154,6 +127,7 @@ class B1LocalizerDS(torch.utils.data.Dataset):
             subject_idx = f.attrs['index']
 
         b1, mask, localizer = self.pad_or_random_crop(b1, mask, localizer)
+
         return {
             'localizer': localizer,
             'b1': b1,
@@ -170,29 +144,53 @@ class B1LocalizerModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        train_dir: str | Path,
-        val_dir: str | Path,
-        batch_size: int,
-        num_workers: int,
-        orientations: Sequence[Literal['Sagittal', 'Coronal', 'Transversal']] = orientations,
-        locations: Sequence[Literal['Minnesota', 'Buch', 'Heidelberg']] = locations,
-        augment: None | DataAugmentation = None,
+        data_dir: str = '/echo/allgemein/projects/MRpro/B1/FFZHK/processed/',
+        batch_size: int = 8,
+        num_workers: int = 8,
+        fold: int = 0,
+        n_folds: int = 4,
+        orientations: Sequence[Literal['Sagittal', 'Coronal', 'Transversal']] = ('Sagittal', 'Coronal', 'Transversal'),
+        locations: Sequence[Literal['Minnesota', 'Buch', 'Heidelberg']] = ('Buch', 'Minnesota', 'Heidelberg'),
+        p_affine: float = 0.75,
+        affine_degrees: float = 5,
+        affine_translate: float = 0.02,
+        affine_scale: float = 0.02,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['augment'])
+        self.save_hyperparameters()
+        self.data_dir = Path(data_dir)
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.augment = augment
-        self.train_dir = train_dir
-        self.val_dir = val_dir
         self.orientations = orientations
         self.locations = locations
+        self.fold = fold
+        self.n_folds = n_folds
+        self.affine = kornia.augmentation.RandomAffine(
+            p=p_affine,
+            degrees=affine_degrees,
+            translate=(affine_translate, affine_translate),
+            scale=(1 - affine_scale, 1 + affine_scale),
+        )
 
     def setup(self, stage: str | None = None) -> None:
         if stage != 'fit':
             raise NotImplementedError(f'not implemeted yet: {stage}')
-        self.train_dataset = B1LocalizerDS(self.train_dir, self.orientations, self.locations)
-        self.val_dataset = B1LocalizerDS(self.val_dir, self.orientations, self.locations)
+        self.train_dataset = B1LocalizerDS(
+            self.data_dir,
+            self.orientations,
+            self.locations,
+            fold=self.fold,
+            n_folds=self.n_folds,
+            train=True,
+        )
+        self.val_dataset = B1LocalizerDS(
+            self.data_dir,
+            self.orientations,
+            self.locations,
+            fold=self.fold,
+            n_folds=self.n_folds,
+            train=False,
+        )
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
@@ -207,9 +205,12 @@ class B1LocalizerModule(pl.LightningDataModule):
     def val_dataloader(self) -> DataLoader:
         return DataLoader(self.val_dataset, batch_size=1, shuffle=False, num_workers=0)
 
-    def on_after_batch_transfer(self, batch: dict, dataloader_idx: int):
-        if self.trainer.training and self.augment:
-            localizer, b1, mask = self.augment(batch['localizer'], batch['b1'], batch['mask'])
+    def on_after_batch_transfer(self, batch: BatchDict, dataloader_idx: int):
+        if self.trainer.training:
+            params = self.affine.forward_parameters(batch['mask'].shape)
+            mask = self.affine(batch['mask'], params=params)
+            localizer = real_to_complex(self.affine(complex_to_real(batch['localizer']), params=params))
+            b1 = real_to_complex(self.affine(complex_to_real(batch['b1']), params=params))
             batch.update(localizer=localizer, b1=b1, mask=mask)
         return batch
 
@@ -233,15 +234,15 @@ class B1Predictor(pl.LightningModule):
 
     def __init__(
         self,
-        lr: float,
-        weight_decay: float,
-        n_features: tuple[int, ...],
-        attention_depths: tuple[int, ...],
+        lr: float = 8e-4,
+        weight_decay: float = 1e-3,
+        n_features: tuple[int, ...] = (64, 128, 192, 192),
+        attention_depths: tuple[int, ...] = (-1, -2),
         append_rss: bool = True,
         n_rx: int = 32,
         n_tx: int = 8,
-        embedding_dim: int = 64,
-        loss: torch.nn.Module = MaskedL1Loss(),
+        embedding_dim: int = 128,
+        loss: torch.nn.Module = MaskedMSELoss(),
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['loss'])
@@ -266,13 +267,15 @@ class B1Predictor(pl.LightningModule):
             torch.nn.Dropout(0.1),
         )
         self.criterion = loss
+        self.validation_plotted = set()
 
-    def forward(self, localizer: torch.Tensor, location: torch.Tensor, orientation: torch.Tensor) -> torch.Tensor:
-        localizer_real = rearrange(
-            torch.view_as_real(localizer),
-            'batch coils y x realimag -> batch (coils realimag) y x',
-        )
-
+    def forward(
+        self,
+        localizer: torch.Tensor,
+        location: torch.Tensor,
+        orientation: torch.Tensor,
+    ) -> torch.Tensor:
+        localizer_real = complex_to_real(localizer)
         if self.hparams.append_rss:
             rss = localizer.abs().square().sum(dim=1).sqrt()
             localizer_real = torch.cat([localizer_real, rss[:, None]], dim=1)
@@ -283,13 +286,7 @@ class B1Predictor(pl.LightningModule):
         cond = self.cond_mlp(cond)
 
         prediction = self.unet(localizer_real, cond=cond)
-        prediction = torch.view_as_complex(
-            rearrange(
-                prediction,
-                'batch (coils realimag) y x -> batch coils y x realimag',
-                realimag=2,
-            ).contiguous()
-        ).to(torch.complex64)
+        prediction = real_to_complex(prediction).to(torch.complex64)
         return prediction
 
     def training_step(self, batch: BatchDict, batch_idx: int):
@@ -324,8 +321,11 @@ class B1Predictor(pl.LightningModule):
 
         subject_idx = batch['subject_idx'][0].item()
         slice_idx = batch['slice_idx'][0].item()
+        orientation_idx = batch['orientation'][0].item()
+        location_idx = batch['location'][0].item()
 
-        if subject_idx == 2 and slice_idx == 5:
+        if slice_idx == 5 and (orientation_idx, location_idx) not in self.validation_plotted:
+            self.validation_plotted.add((orientation_idx, location_idx))
             n_tx = self.hparams.n_tx
             fig, axes = plt.subplots(4, n_tx, figsize=(n_tx * 2, 8), constrained_layout=True)
             nan_mask = np.where(mask[0].cpu().numpy() < 0.5, np.nan, 1)
@@ -355,6 +355,9 @@ class B1Predictor(pl.LightningModule):
 
         return metrics['loss']
 
+    def on_validation_epoch_end(self):
+        self.validation_plotted.clear()
+
     def configure_optimizers(self):
         decay, no_decay = [], []
         for name, param in self.named_parameters():
@@ -371,7 +374,7 @@ class B1Predictor(pl.LightningModule):
             lr=self.hparams.lr,
         )
 
-        sched_g = OneCycleLR(
+        sched_g = torch.optim.lr_scheduler.OneCycleLR(
             opt_g,
             max_lr=self.hparams.lr,
             total_steps=self.trainer.estimated_stepping_batches,
@@ -382,61 +385,68 @@ class B1Predictor(pl.LightningModule):
         return [opt_g], [{'scheduler': sched_g, 'interval': 'step'}]
 
 
+class MyLightningCLI(LightningCLI):
+    """Custom CLI to inject logger and callbacks with minimal arguments."""
+
+    def add_arguments_to_parser(self, parser):
+        parser.add_argument('--experiment', type=str, default='B1 prediction', help='Name of the experiment.')
+        parser.add_argument('--neptune_project', type=str, default='ptb/b1p', help='Neptune project name.')
+        parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/b1', help='path for checkpoints.')
+        parser.set_defaults({'data': {'class_path': '__main__.B1LocalizerModule'}})
+
+    def before_instantiate_classes(self):
+        config = self.config.fit
+        fold = config.data.init_args.fold
+        experiment_name = config.experiment
+
+        logger = NeptuneLogger(
+            project=config.neptune_project,
+            name=f'{experiment_name}-fold{fold}',
+            tags=[experiment_name, f'fold_{fold}'],
+            log_model_checkpoints=False,
+            dependencies='infer',
+            source_files=[__file__],
+        )
+        _ = logger.run
+
+        checkpoint_callback = ModelCheckpoint(
+            monitor='validation/loss',
+            mode='min',
+            save_top_k=3,
+            save_last=True,
+            dirpath=f'{config.checkpoint_dir}/{logger.version}',
+            filename=f'{logger.version}-{{epoch:02d}}-{{val_loss:.4f}}',
+        )
+
+        config.trainer.logger = logger
+        config.trainer.callbacks = [
+            LearningRateMonitor(logging_interval='step'),
+            checkpoint_callback,
+        ]
+
+    def after_instantiate_classes(self):
+        """Log model summary after the model and logger are instantiated."""
+        self.trainer.logger.log_model_summary(model=self.model, max_depth=-1)
+
+
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
     torch._inductor.config.worker_start_method = 'fork'
     torch._inductor.config.compile_threads = 4
     torch._dynamo.config.capture_scalar_outputs = True
 
-    dm = B1LocalizerModule(
-        train_dir='/echo/allgemein/projects/MRpro/B1/FFZHK/processed/train',
-        val_dir='/echo/allgemein/projects/MRpro/B1/FFZHK/processed/val',
-        batch_size=8,
-        num_workers=8,
-        augment=DataAugmentation(),
-        locations=('Buch', 'Minnesota', 'Heidelberg'),
+    cli = MyLightningCLI(
+        B1Predictor,
+        B1LocalizerModule,
+        save_config_callback=None,
+        subclass_mode_data=True,
+        seed_everything_default=123,
+        trainer_defaults={
+            'max_epochs': 400,
+            'accelerator': 'gpu',
+            'devices': 1,
+            'precision': '32-true',
+            'log_every_n_steps': 2,
+            'check_val_every_n_epoch': 4,
+        },
     )
-
-    model = B1Predictor(
-        lr=5e-4,
-        weight_decay=1e-3,
-        n_features=(64, 96, 128, 128),
-        attention_depths=(-1,),
-        append_rss=True,
-        embedding_dim=128,
-        loss=MaskedMSELoss(),
-    )
-
-    logger = NeptuneLogger(
-        project='ptb/b1p',
-        log_model_checkpoints=False,
-        dependencies='infer',
-        source_files=[__file__],
-    )
-    logger.log_model_summary(model=model, max_depth=-1)
-    checkpoint_callback = ModelCheckpoint(
-        monitor='validation/l1',
-        mode='min',
-        save_top_k=3,
-        dirpath=f'checkpoints/b1/{logger.version}',
-        filename=f'b1-{logger.version}-{{epoch:02d}}-{{validation/l1:.4f}}',
-        save_last=True,
-    )
-    ddp_strategy = DDPStrategy(find_unused_parameters=False)
-
-    trainer = pl.Trainer(
-        max_epochs=200,
-        accelerator='gpu',
-        devices=1,
-        logger=logger,
-        callbacks=[
-            LearningRateMonitor(logging_interval='step'),
-            checkpoint_callback,
-        ],
-        log_every_n_steps=2,
-        check_val_every_n_epoch=4,
-        precision='32-true',
-        # strategy=ddp_strategy,
-    )
-
-    trainer.fit(model, datamodule=dm)

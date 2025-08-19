@@ -5,6 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 data_path = Path('/echo/allgemein/projects/MRpro/B1/FFZHK')
+MAX_B1 = 120
 
 for locationpath in filter(lambda x: x.is_dir(), data_path.iterdir()):
     for orientationpath in filter(lambda x: x.is_dir(), locationpath.iterdir()):
@@ -39,17 +40,17 @@ for locationpath in filter(lambda x: x.is_dir(), data_path.iterdir()):
                     np.complex64
                 )
                 b1 = np.array(f['CombB1RFromAFI']['real'] + 1j * np.array(f['CombB1RFromAFI']['imag']))
-                mean_phase = np.angle(np.mean(b1[1:6], axis=0, keepdims=True))  # TODO: check why only these 5 coils
+                mean_phase = np.angle(np.mean(b1[1:6], axis=0, keepdims=True))
                 b1 = b1 * np.exp(-1j * mean_phase)
                 b1 = process(b1).astype(np.complex64)
                 mask = process(np.array(f['mask_brain']).astype(bool))
                 localizer = np.nan_to_num(localizer)
                 localizer = localizer / np.abs(localizer).max()
                 bad_values = np.any(np.abs(b1) > 120, axis=-1)
-                b1[np.abs(b1) > 360] = 360 * np.exp(1j * np.angle(b1[np.abs(b1) > 360]))
+                b1[np.abs(b1) > MAX_B1] = MAX_B1 * np.exp(1j * np.angle(b1[np.abs(b1) > MAX_B1]))
                 b1 = np.nan_to_num(b1) / 90
                 mask = mask & ~bad_values
-                outpath = data_path / 'processed' / f'{location}_{orientation}_{i}.h5'
+                outpath = data_path / 'processed' / f'{location}_{orientation}_{i:02d}.h5'
                 outpath.parent.mkdir(parents=True, exist_ok=True)
                 with h5py.File(outpath, 'w') as f:
                     f.create_dataset('localizer', data=localizer)
@@ -58,3 +59,4 @@ for locationpath in filter(lambda x: x.is_dir(), data_path.iterdir()):
                     f.attrs['location'] = location
                     f.attrs['orientation'] = orientation
                     f.attrs['index'] = i
+                    f.attrs['filename'] = str(fn.stem)
