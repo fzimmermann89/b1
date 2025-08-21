@@ -6,8 +6,8 @@ from typing import Literal, TypedDict
 
 import h5py
 import kornia.augmentation
+import lightning.pytorch
 import numpy as np
-import pytorch_lightning as pl
 import torch
 
 from b1prediction.util import complex_to_real, real_to_complex
@@ -121,7 +121,7 @@ class B1LocalizerDS(torch.utils.data.Dataset):
         """Return the total number of slices."""
         return sum(self.n_slices)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> BatchDict:
         """Get a single sample."""
         cum_slices = torch.cumsum(torch.tensor(self.n_slices), dim=0)
         total_slices = cum_slices[-1]
@@ -152,7 +152,7 @@ class B1LocalizerDS(torch.utils.data.Dataset):
         }
 
 
-class B1LocalizerModule(pl.LightningDataModule):
+class B1LocalizerModule(lightning.pytorch.LightningDataModule):
     """DataModule providing augmented inputs and targets."""
 
     def __init__(
@@ -264,7 +264,7 @@ class B1LocalizerModule(pl.LightningDataModule):
         """
         return torch.utils.data.DataLoader(self.val_dataset, batch_size=1, shuffle=False, num_workers=0)
 
-    def on_after_batch_transfer(self, batch: BatchDict, dataloader_idx: int) -> BatchDict:
+    def on_after_batch_transfer(self, batch: BatchDict, dataloader_idx: int) -> BatchDict:  # noqa: ARG002
         """Apply augmentation after batch transfer.
 
         Parameters

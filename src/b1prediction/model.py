@@ -1,8 +1,8 @@
 """B1 prediction model and loss functions."""
 
+import lightning.pytorch
 import matplotlib.pyplot as plt
 import numpy as np
-import pytorch_lightning as pl
 import torch
 from mrpro.nn.nets import UNet
 from torchmetrics.functional import structural_similarity_index_measure
@@ -59,13 +59,13 @@ class MaskedMSELoss(torch.nn.Module):
         return loss
 
 
-class B1Predictor(pl.LightningModule):
+class B1Predictor(lightning.pytorch.LightningModule):
     """B1 prediction from localizer."""
 
     def __init__(
         self,
-        lr: float = 5e-4,
-        weight_decay: float = 1e-4,
+        lr: float = 5e-4,  # noqa: ARG002
+        weight_decay: float = 1e-4,  # noqa: ARG002
         n_features: tuple[int, ...] = (64, 128, 192, 192),
         attention_depths: tuple[int, ...] = (-1, -2),
         append_rss: bool = True,
@@ -74,7 +74,7 @@ class B1Predictor(pl.LightningModule):
         embedding_dim: int = 128,
         loss: torch.nn.Module = MaskedMSELoss(),
         p_dropout_cond: float = 0.2,
-        plot_validation_images: bool = True,
+        plot_validation_images: bool = True,  # noqa: ARG002
     ):
         """Initialize the B1 predictor model.
 
@@ -163,7 +163,7 @@ class B1Predictor(pl.LightningModule):
         prediction = real_to_complex(prediction).to(torch.complex64)
         return prediction
 
-    def training_step(self, batch: BatchDict, batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: BatchDict, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
         """Run training step.
 
         Parameters
@@ -182,7 +182,7 @@ class B1Predictor(pl.LightningModule):
         self.log('train_loss', loss, prog_bar=True, on_epoch=True, sync_dist=True)
         return loss
 
-    def validation_step(self, batch: BatchDict, batch_idx: int) -> torch.Tensor:
+    def validation_step(self, batch: BatchDict, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
         """Run validation step.
 
         Parameters

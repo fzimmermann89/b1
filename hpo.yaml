@@ -1,0 +1,52 @@
+# Run with: b1 tune --config hpo.yaml
+
+
+trainer:
+  max_epochs: 50
+
+slurm_config:
+  num_workers: 8
+  gres: 'shard:1'
+
+hpo_config:
+  n_trials: 40
+  storage: 'sqlite:///optuna.db'
+
+
+search_space:
+  - name: lr
+    type: 'float'
+    low: 1e-5
+    high: 1e-3
+    log: true
+
+  - name: weight_decay
+    type: 'float'
+    low: 1e-6
+    high: 1e-2
+    log: true
+
+  - name: n_features
+    type: categorical_ast
+    choices:
+      - '(64, 128, 192, 192)'
+      - '(64, 128, 256, 256)'
+      - '(64, 96, 128, 192)'
+
+  - name: attention_depths
+    type: categorical_ast
+    choices:
+      - '(-1, -2)'
+      - '()'
+      - '(-1,)'
+
+  - name: embedding_dim
+    type: categorical
+    choices:
+      - 64
+      - 128
+
+  - name: p_affine
+    type: float
+    low: 0.0
+    high: 0.9

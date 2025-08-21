@@ -1,20 +1,23 @@
 """CLI application for B1 prediction training."""
 
+import ast
+import dataclasses
 import os
 import shlex
 import subprocess
 import sys
 import warnings
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from pathlib import Path
+from typing import Literal
 
+import jsonargparse
+import lightning.pytorch
+import lightning.pytorch.callbacks
+import lightning.pytorch.cli
+import lightning.pytorch.loggers
 import optuna
-import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-from pytorch_lightning.cli import LightningCLI
-from pytorch_lightning.loggers import NeptuneLogger
-from pytorch_lightning.trainer import Trainer
+from optuna.integration.pytorch_lightning import PyTorchLightningPruningCallback
 
 from b1prediction.data import B1LocalizerModule
 from b1prediction.model import B1Predictor
@@ -24,10 +27,10 @@ if not sys.warnoptions:
     os.environ['PYTHONWARNINGS'] = 'ignore'
 
 
-class MyLightningCLI(LightningCLI):
+class MyLightningCLI(lightning.pytorch.cli.LightningCLI):
     """Custom CLI."""
 
-    def add_arguments_to_parser(self, parser):
+    def add_arguments_to_parser(self, parser: jsonargparse.ArgumentParser) -> None:
         """Add custom arguments to the parser."""
         parser.add_argument('--experiment', type=str, default='B1 prediction', help='Name of the experiment.')
         parser.add_argument('--neptune_project', type=str, default='ptb/b1p', help='Neptune project name.')
@@ -43,18 +46,18 @@ class MyLightningCLI(LightningCLI):
         if self.subcommand != 'fit':
             return
 
-        logger = NeptuneLogger(
+        logger = lightning.pytorch.loggers.NeptuneLogger(
             project=config.neptune_project,
             name=f'{experiment_name}-fold{fold}',
             tags=[experiment_name, f'fold_{fold}'],
             log_model_checkpoints=False,
             dependencies='infer',
-            source_files=[__file__],
+            source_files=[str(o) for o in Path(__file__).parent.rglob('*.py')],
         )
         _ = logger.run
         config.trainer.logger = logger
 
-        checkpoint_callback = ModelCheckpoint(
+        checkpoint_callback = lightning.pytorch.callbacks.ModelCheckpoint(
             monitor='validation/loss',
             mode='min',
             save_top_k=3,
@@ -64,19 +67,20 @@ class MyLightningCLI(LightningCLI):
         )
 
         config.trainer.callbacks = [
-            LearningRateMonitor(logging_interval='step'),
+            lightning.pytorch.callbacks.LearningRateMonitor(logging_interval='step'),
             checkpoint_callback,
         ]
 
     def after_instantiate_classes(self) -> None:
         """Log model summary after the model and logger are instantiated."""
-        if isinstance(self.trainer.logger, NeptuneLogger):
+        if isinstance(self.trainer.logger, lightning.pytorch.loggers.NeptuneLogger):
             self.trainer.logger.log_model_summary(model=self.model, max_depth=-1)
         config = getattr(self.config, self.subcommand)
         self.trainer.cli_config = config
 
     @staticmethod
     def subcommands() -> dict[str, set[str]]:
+        """Define trainer functions to use as subcommands of the CLI."""
         return {
             'fit': {'model', 'train_dataloaders', 'val_dataloaders', 'datamodule'},
             'validate': {'model', 'dataloaders', 'datamodule'},
@@ -84,7 +88,7 @@ class MyLightningCLI(LightningCLI):
         }
 
 
-@dataclass
+@dataclasses.dataclass
 class SlurmManager:
     """Manages SLURM job configuration and submission."""
 
@@ -115,7 +119,7 @@ class SlurmManager:
         subprocess.run(sbatch_command, shell=True, check=True)
 
 
-@dataclass
+@dataclasses.dataclass
 class HPOConfig:
     """Configuration for Optuna HPO with sensible defaults."""
 
@@ -123,21 +127,26 @@ class HPOConfig:
     metric: str = 'validation/loss'
     direction: str = 'minimize'
     n_trials: int = 100
+    sampler: optuna.samplers.BaseSampler = dataclasses.field(default_factory=optuna.samplers.TPESampler)
+    pruner: optuna.pruners.BasePruner = dataclasses.field(
+        default_factory=lambda: optuna.pruners.MedianPruner(n_warmup_steps=1000)
+    )
 
 
-@dataclass
+@dataclasses.dataclass
 class SearchSpaceItem:
     """Defines a single hyperparameter for Optuna to search."""
 
-    type: Literal['float', 'int', 'categorical']
+    name: str
+    type: Literal['float', 'int', 'categorical', 'categorical_ast']
     low: float | None = None
     high: float | None = None
     step: float | None = None
     log: bool = False
-    choices: list[str | float | int] = field(default_factory=list)
+    choices: list[int | float | str] = dataclasses.field(default_factory=list)
 
 
-class HPOTrainer(Trainer):
+class HPOTrainer(lightning.pytorch.Trainer):
     """Custom trainer with hyperparameter tuning."""
 
     experiment: str
@@ -145,9 +154,9 @@ class HPOTrainer(Trainer):
 
     def tune(
         self,
-        model: 'pl.LightningModule',
-        datamodule: 'pl.LightningDataModule | None' = None,
-        search_space: dict[str, Any] = {},
+        model: lightning.pytorch.LightningModule,
+        datamodule: lightning.pytorch.LightningDataModule | None = None,
+        search_space: tuple[SearchSpaceItem, ...] = (),
         hpo_config: HPOConfig = HPOConfig(),
         slurm_config: SlurmManager = SlurmManager(),
         worker: bool = False,
@@ -161,12 +170,14 @@ class HPOTrainer(Trainer):
     def _launch_slurm_jobs(self, slurm_config: SlurmManager, hpo_config: HPOConfig) -> None:
         """Create an Optuna study and submit worker jobs to SLURM."""
         print('--- Starting SLURM HPO Master ---')
-        study_name = f'{self.cli_config.experiment.lower().replace(" ", "_")}_HPO'
+        study_name = self.cli_config.experiment.lower().replace(' ', '_')
         optuna.create_study(
             storage=hpo_config.storage,
             study_name=study_name,
             direction=hpo_config.direction,
             load_if_exists=True,
+            sampler=hpo_config.sampler,
+            pruner=hpo_config.pruner,
         )
         print(f"Optuna study '{study_name}' at: {hpo_config.storage}")
         original_args = ' '.join(shlex.quote(arg) for arg in sys.argv[2:])
@@ -177,38 +188,51 @@ class HPOTrainer(Trainer):
             slurm_config.submit(worker_command, job_name=study_name)
 
         print(f'\n{slurm_config.num_workers} workers submitted. Monitor with `squeue`.')
-        print(f'To see best params: optuna studies --study-name "{study_name}" --storage "{hpo_config.storage}"')
+        print(f'To see trials: optuna trials --study-name "{study_name}" --storage "{hpo_config.storage}"')
 
     def _run_worker(
         self,
-        model: pl.LightningModule,
-        datamodule: pl.LightningDataModule,
-        search_space: dict[str, Any],
+        model: lightning.pytorch.LightningModule,
+        datamodule: lightning.pytorch.LightningDataModule,
+        search_space: list[SearchSpaceItem],
         hpo_config: HPOConfig,
     ) -> None:
         """Run a single Optuna worker process."""
-        study = optuna.load_study(study_name=f'{self.cli_config.experiment}_HPO', storage=hpo_config.storage)
+        study_name = self.cli_config.experiment.lower().replace(' ', '_')
+        study = optuna.load_study(study_name=study_name, storage=hpo_config.storage)
 
         def objective(trial: optuna.trial.Trial) -> float:
             model_cfg = dict(model.hparams)
-            search_items = {k: SearchSpaceItem(**v) for k, v in search_space.items()}
+            data_cfg = dict(datamodule.hparams)
 
-            for name, param in search_items.items():
-                if param.type == 'float':
-                    model_cfg[name] = trial.suggest_float(name, param.low, param.high, log=param.log, step=param.step)
-                elif param.type == 'int':
-                    model_cfg[name] = trial.suggest_int(name, param.low, param.high, step=param.step)
-                elif param.type == 'categorical':
-                    model_cfg[name] = trial.suggest_categorical(name, param.choices)
+            for p in search_space:
+                if p.name in model_cfg:
+                    cfg = model_cfg
+                elif p.name in data_cfg:
+                    cfg = data_cfg
+                else:
+                    raise ValueError(f'Parameter {p.name} not found in model or datamodule configuration.')
+
+                if p.type == 'float':
+                    cfg[p.name] = trial.suggest_float(p.name, p.low, p.high, log=p.log, step=p.step)
+                elif p.type == 'int':
+                    cfg[p.name] = trial.suggest_int(p.name, p.low, p.high, step=p.step)
+                elif p.type == 'categorical':
+                    cfg[p.name] = trial.suggest_categorical(p.name, p.choices)
+                elif p.type == 'categorical_ast':
+                    cfg[p.name] = ast.literal_eval(trial.suggest_categorical(p.name, p.choices))
 
             model_cfg['plot_validation_images'] = False
-            del model_cfg['_instantiator']
+            model_cfg = {k: v for k, v in model_cfg.items() if not k.startswith('_')}
+            data_cfg = {k: v for k, v in data_cfg.items() if not k.startswith('_')}
             trial_model = B1Predictor(**model_cfg)
+            trial_datamodule = B1LocalizerModule(**data_cfg)
 
-            logger = NeptuneLogger(
+            logger = lightning.pytorch.loggers.NeptuneLogger(
                 project=self.cli_config.neptune_project,
                 name=f'{self.cli_config.experiment}-trial-{trial.number}',
                 tags=[self.cli_config.experiment, 'hpo', f'trial_{trial.number}'],
+                source_files=[str(o) for o in Path(__file__).parent.rglob('*.py')],
             )
             logger.run['hpo/params'] = trial.params
             trainer_cfg = dict(self.cli_config.trainer)
@@ -216,10 +240,13 @@ class HPOTrainer(Trainer):
             trainer_cfg['enable_checkpointing'] = False
             trainer_cfg['enable_progress_bar'] = False
             trainer_cfg['callbacks'] = [
-                pl.callbacks.EarlyStopping(monitor=hpo_config.metric, patience=10, mode=hpo_config.direction[:3])
+                lightning.pytorch.callbacks.EarlyStopping(
+                    monitor=hpo_config.metric, patience=10, mode=hpo_config.direction[:3]
+                ),
+                PyTorchLightningPruningCallback(trial, monitor=hpo_config.metric),
             ]
-            trial_trainer = Trainer(**trainer_cfg)
-            trial_trainer.fit(trial_model, datamodule=datamodule)
+            trial_trainer = lightning.pytorch.Trainer(**trainer_cfg)
+            trial_trainer.fit(trial_model, datamodule=trial_datamodule)
             return trial_trainer.callback_metrics[hpo_config.metric].item()
 
         study.optimize(objective, n_trials=hpo_config.n_trials, n_jobs=1)
@@ -243,7 +270,7 @@ def main() -> None:
             'max_epochs': 400,
             'accelerator': 'gpu',
             'devices': 1,
-            'precision': '32-true',
+            'precision': '16-mixed',
             'log_every_n_steps': 2,
             'check_val_every_n_epoch': 4,
         },
