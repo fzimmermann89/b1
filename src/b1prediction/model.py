@@ -60,7 +60,10 @@ class MaskedMSELoss(torch.nn.Module):
 
 
 class B1Predictor(lightning.pytorch.LightningModule):
-    """B1 prediction from localizer."""
+    """B1 prediction from localizer.
+    
+    Uses a standard UNet from mrpro + a conditioning network
+    """
 
     def __init__(
         self,
@@ -106,6 +109,7 @@ class B1Predictor(lightning.pytorch.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=['loss'])
 
+        # The actual network predicting the B1+
         self.unet = UNet(
             n_dim=2,
             n_channels_in=n_rx * 2 + append_rss,
@@ -116,6 +120,10 @@ class B1Predictor(lightning.pytorch.LightningModule):
             encoder_blocks_per_scale=2,
         )
         self.unet = torch.compile(self.unet, dynamic=False, fullgraph=True)
+        
+        # Additional information for the network about the location and orientation
+        # This is used to create a "cond" for the unet based on location+orientation, that is 
+        # used for Film conditioning inside the unet.
         self.location_embedding = torch.nn.Embedding(len(locations), embedding_dim // 2)
         self.orientation_embedding = torch.nn.Embedding(len(orientations), embedding_dim // 2)
         self.cond_mlp = torch.nn.Sequential(
@@ -154,6 +162,7 @@ class B1Predictor(lightning.pytorch.LightningModule):
             rss = localizer.abs().square().sum(dim=1).sqrt()
             localizer_real = torch.cat([localizer_real, rss[:, None]], dim=1)
 
+        # create cond
         location_emb = self.location_embedding(location)
         orientation_emb = self.orientation_embedding(orientation)
         cond = torch.cat([location_emb, orientation_emb], dim=1)
@@ -227,7 +236,7 @@ class B1Predictor(lightning.pytorch.LightningModule):
         if (
             self.hparams.plot_validation_images
             and slice_idx == 5
-            and (orientation_idx, location_idx) not in self.validation_plotted
+            and (orientation_idx, location_idx) not in self.validation_plotted # dont plot twice..
         ):
             self.validation_plotted.add((orientation_idx, location_idx))
             n_tx = self.hparams.n_tx

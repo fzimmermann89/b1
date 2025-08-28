@@ -1,3 +1,5 @@
+# Pre-processing of the .mat files (rotation, coil matching)
+
 import argparse
 from pathlib import Path
 
@@ -24,7 +26,7 @@ def process(data: np.ndarray, location: str, orientation: str) -> np.ndarray:
         else:
             data = np.flip(data, axis=-1)
     if 'Min' in location and is_b1:
-        data = np.roll(data, shift=1, axis=0)
+        data = np.roll(data, shift=1, axis=0) # coils are rotated
     if is_b1 or is_localizer:
         data = np.moveaxis(data, 0, -1)
     return data
